@@ -7,11 +7,13 @@ edition = "2021"
 
 [dependencies]
 crates_io_api = "0.11.0"
-serde = { version = "1.0.210", features = ["derive"]}
+serde = { version = "1.0.210", features = ["derive"] }
 serde_json = "1.0.132"
-reqwest = { version = "0.12.8", features = ["blocking"]}
+reqwest = { version = "0.12.8", features = ["blocking"] }
 regex = "1.11.0"
 tempfile = "3.13.0"
+tree-sitter = "0.24.3"
+tree-sitter-c = "0.23.1"
 
 [[bin]]
 name = "header2crate"

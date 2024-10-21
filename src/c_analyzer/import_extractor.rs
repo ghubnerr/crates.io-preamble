@@ -1,14 +1,16 @@
-use regex;
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fs;
 use std::path::{Path, PathBuf};
 use tempfile;
+use tree_sitter::{Language, Node, Parser, TreeCursor};
 
 pub struct CFileAnalyzer {
     include_paths: Vec<PathBuf>,
     parsed_files: HashMap<PathBuf, ParsedFile>,
     import_graph: HashMap<PathBuf, Vec<PathBuf>>,
+    parser: Parser,
+    source: String,
 }
 
 struct ParsedFile {
@@ -69,46 +71,45 @@ impl From<std::io::Error> for AnalyzerError {
 
 impl CFileAnalyzer {
     pub fn new() -> Self {
-        println!("Creating new CFileAnalyzer");
+        let mut parser = Parser::new();
+        parser
+            .set_language(&Language::new(tree_sitter_c::LANGUAGE))
+            .expect("Error setting language");
+
         CFileAnalyzer {
             include_paths: vec![],
             parsed_files: HashMap::new(),
             import_graph: HashMap::new(),
+            parser,
+            source: String::new(),
         }
     }
 
     pub fn add_include_path(&mut self, path: PathBuf) {
-        println!("Adding include path: {:?}", path);
         self.include_paths.push(path);
     }
 
     pub fn parse_file(&mut self, path: &Path) -> Result<(), AnalyzerError> {
-        println!("Parsing file: {:?}", path);
-        let content = fs::read_to_string(path)?;
-        let parsed_file = self.parse_content(path, &content)?;
+        self.source = fs::read_to_string(path)?;
+        let tree = self
+            .parser
+            .parse(&self.source, None)
+            .ok_or_else(|| AnalyzerError::ParseError("Failed to parse file".to_string()))?;
+        let root_node = tree.root_node();
 
-        println!("Inserting parsed file into parsed_files");
+        let parsed_file = self.parse_content(path, &root_node)?;
         self.parsed_files.insert(path.to_path_buf(), parsed_file);
         self.update_import_graph(path);
 
-        println!("File parsed successfully: {:?}", path);
         Ok(())
     }
 
-    fn parse_content(&self, path: &Path, content: &str) -> Result<ParsedFile, AnalyzerError> {
-        println!("Parsing content of file: {:?}", path);
-        let imports = self.extract_imports(content);
-        let functions = self.extract_functions(content);
-        let types = self.extract_types(content);
-        let macros = self.extract_macros(content);
+    fn parse_content(&self, path: &Path, node: &Node) -> Result<ParsedFile, AnalyzerError> {
+        let imports = self.extract_imports(node);
+        let functions = self.extract_functions(node);
+        let types = self.extract_types(node);
+        let macros = self.extract_macros(node);
 
-        println!(
-            "Content parsed: {} imports, {} functions, {} types, {} macros",
-            imports.len(),
-            functions.len(),
-            types.len(),
-            macros.len()
-        );
         Ok(ParsedFile {
             path: path.to_path_buf(),
             imports,
@@ -118,161 +119,256 @@ impl CFileAnalyzer {
         })
     }
 
-    fn extract_imports(&self, content: &str) -> Vec<Import> {
-        println!("Extracting imports");
-        let imports: Vec<_> = content
-            .lines()
-            .filter(|line| line.trim().starts_with("#include"))
-            .map(|line| {
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                let path = parts[1]
-                    .trim_matches(|c| c == '"' || c == '<' || c == '>')
-                    .to_string();
-                let is_system = line.contains('<');
-                println!("Found import: {} (system: {})", path, is_system);
-                Import { path, is_system }
-            })
-            .collect();
-        println!("Extracted {} imports", imports.len());
+    fn extract_imports(&self, node: &Node) -> Vec<Import> {
+        let mut imports = Vec::new();
+        let mut cursor = node.walk();
+
+        self.traverse_tree(cursor, |node| {
+            if node.kind() == "preproc_include" {
+                if let Some(path) = node.child_by_field_name("path") {
+                    let mut path_text = path
+                        .utf8_text(self.source.as_bytes())
+                        .unwrap_or("")
+                        .to_string();
+                    let is_system = path.kind() == "system_lib_string";
+
+                    // Remove surrounding angle brackets or quotation marks
+                    path_text = path_text
+                        .trim_start_matches('<')
+                        .trim_start_matches('"')
+                        .trim_end_matches('>')
+                        .trim_end_matches('"')
+                        .to_string();
+
+                    imports.push(Import {
+                        path: path_text,
+                        is_system,
+                    });
+                }
+            }
+        });
+
         imports
     }
 
-    fn extract_functions(&self, content: &str) -> Vec<Function> {
-        println!("Extracting functions");
+    fn extract_functions(&self, node: &Node) -> Vec<Function> {
         let mut functions = Vec::new();
-        let re = regex::Regex::new(r"(\w+)\s+(\w+)\((.*?)\);").unwrap();
+        let mut cursor = node.walk();
 
-        for cap in re.captures_iter(content) {
-            let return_type = cap[1].to_string();
-            let name = cap[2].to_string();
-            let params_str = &cap[3];
-            let parameters = self.extract_parameters(params_str);
+        self.traverse_tree(cursor, |node| {
+            if node.kind() == "function_definition" || node.kind() == "declaration" {
+                if let Some(declarator) = node.child_by_field_name("declarator") {
+                    if let Some(name) = self.get_function_name(&declarator) {
+                        let return_type = self.get_return_type(node);
+                        let parameters = self.get_parameters(&declarator);
+                        functions.push(Function {
+                            name,
+                            return_type,
+                            parameters,
+                        });
+                    }
+                }
+            }
+        });
 
-            println!("Found function: {} (return type: {})", name, return_type);
-            functions.push(Function {
-                name,
-                return_type,
-                parameters,
-            });
-        }
-        println!("Extracted {} functions", functions.len());
         functions
     }
 
-    fn extract_parameters(&self, params_str: &str) -> Vec<(String, String)> {
-        println!("Extracting parameters from: {}", params_str);
-        let params: Vec<_> = params_str
-            .split(',')
-            .map(|p| p.trim())
-            .filter(|p| !p.is_empty())
-            .map(|param| {
-                let parts: Vec<&str> = param.split_whitespace().collect();
-                if parts.len() == 2 {
-                    println!("Found parameter: {} {}", parts[0], parts[1]);
-                    (parts[0].to_string(), parts[1].to_string())
-                } else {
-                    println!("Special case parameter: void");
-                    ("void".to_string(), "".to_string())
-                }
-            })
-            .collect();
-        println!("Extracted {} parameters", params.len());
-        params
-    }
-
-    fn extract_macros(&self, content: &str) -> Vec<Macro> {
-        println!("Extracting macros");
-        let mut macros = Vec::new();
-        let re = regex::Regex::new(r"(?m)^\s*#\s*define\s+(\w+)(\([^)]*\))?\s*(.*)").unwrap();
-
-        for cap in re.captures_iter(content) {
-            println!("Found macro: {}", cap[1].to_string());
-            macros.push(Macro {
-                name: cap[1].to_string(),
-                parameters: cap.get(2).map(|m| m.as_str().to_string()),
-                definition: cap[3].trim().to_string(),
-            });
-        }
-
-        println!("Extracted {} macros", macros.len());
-        macros
-    }
-
-    fn extract_types(&self, content: &str) -> Vec<TypeDef> {
-        println!("Extracting types");
+    fn extract_types(&self, node: &Node) -> Vec<TypeDef> {
         let mut types = Vec::new();
-        let re =
-            regex::Regex::new(r"typedef\s+(?:struct\s+\w+\s*\{[^\}]*\}\s+|\w+\s+)(\w+);").unwrap();
+        let mut cursor = node.walk();
 
-        for cap in re.captures_iter(content) {
-            println!("Found type: {}", cap[1].to_string());
-            types.push(TypeDef {
-                definition: cap.get(0).unwrap().as_str().to_string(),
-                name: cap[1].to_string(),
-            });
-        }
-        println!("Extracted {} types", types.len());
+        self.traverse_tree(cursor, |node| {
+            if node.kind() == "type_definition" {
+                // Handle typedef cases
+                if let Some(name_node) = node.child_by_field_name("name") {
+                    let name_text = name_node
+                        .utf8_text(self.source.as_bytes())
+                        .unwrap_or("")
+                        .to_string();
+
+                    let definition_node = node.child_by_field_name("type");
+                    let definition_text = definition_node
+                        .and_then(|n| n.utf8_text(self.source.as_bytes()).ok())
+                        .unwrap_or("")
+                        .to_string();
+
+                    types.push(TypeDef {
+                        name: name_text,
+                        definition: definition_text,
+                    });
+                }
+            } else if node.kind() == "struct_specifier" || node.kind() == "enum_specifier" {
+                // Handle struct and enum specifiers
+                if let Some(name_node) = node.child_by_field_name("name") {
+                    let name_text = name_node
+                        .utf8_text(self.source.as_bytes())
+                        .unwrap_or("")
+                        .to_string();
+
+                    let definition_text = node
+                        .utf8_text(self.source.as_bytes())
+                        .unwrap_or("")
+                        .to_string();
+
+                    types.push(TypeDef {
+                        name: name_text,
+                        definition: definition_text,
+                    });
+                }
+            }
+        });
+
         types
     }
 
+    fn extract_macros(&self, node: &Node) -> Vec<Macro> {
+        let mut macros = Vec::new();
+        let mut cursor = node.walk();
+
+        self.traverse_tree(cursor, |node| {
+            // Debug: Print the kind of each node to understand what the tree contains
+            // println!("Node kind: {}", node.kind());
+
+            if node.kind() == "preproc_def" || node.kind() == "preproc_function_def" {
+                if let Some(name) = node.child_by_field_name("name") {
+                    let name_text = name
+                        .utf8_text(self.source.as_bytes())
+                        .unwrap_or("")
+                        .to_string();
+
+                    // Handle both parameterized and non-parameterized macros
+                    let parameters = self.get_macro_parameters(node);
+                    let definition = self.get_macro_definition(node);
+
+                    macros.push(Macro {
+                        name: name_text,
+                        parameters,
+                        definition,
+                    });
+                }
+            }
+        });
+
+        macros
+    }
+
+    fn traverse_tree<F>(&self, mut cursor: TreeCursor, mut f: F)
+    where
+        F: FnMut(&Node),
+    {
+        let mut stack = Vec::new();
+        loop {
+            f(&cursor.node());
+
+            if cursor.goto_first_child() {
+                stack.push(cursor.clone());
+            } else {
+                while !cursor.goto_next_sibling() {
+                    if let Some(parent) = stack.pop() {
+                        cursor = parent;
+                    } else {
+                        return; // We've finished traversing the tree
+                    }
+                }
+            }
+        }
+    }
+
+    fn get_function_name(&self, declarator: &Node) -> Option<String> {
+        declarator
+            .child_by_field_name("declarator")?
+            .utf8_text(self.source.as_bytes())
+            .ok()
+            .map(|s| s.to_string())
+    }
+
+    fn get_return_type(&self, function_node: &Node) -> String {
+        function_node
+            .child_by_field_name("type")
+            .and_then(|n| n.utf8_text(self.source.as_bytes()).ok())
+            .unwrap_or("")
+            .to_string()
+    }
+
+    fn get_parameters(&self, declarator: &Node) -> Vec<(String, String)> {
+        let mut parameters = Vec::new();
+        if let Some(param_list) = declarator.child_by_field_name("parameters") {
+            for param in param_list.children(&mut param_list.walk()) {
+                if param.kind() == "parameter_declaration" {
+                    let param_type = param
+                        .child_by_field_name("type")
+                        .and_then(|n| n.utf8_text(self.source.as_bytes()).ok())
+                        .unwrap_or("")
+                        .to_string();
+                    let param_name = param
+                        .child_by_field_name("declarator")
+                        .and_then(|n| n.utf8_text(self.source.as_bytes()).ok())
+                        .unwrap_or("")
+                        .to_string();
+                    parameters.push((param_type, param_name));
+                }
+            }
+        }
+        parameters
+    }
+
+    fn get_macro_parameters(&self, macro_node: &Node) -> Option<String> {
+        macro_node
+            .child_by_field_name("parameters")
+            .and_then(|n| n.utf8_text(self.source.as_bytes()).ok())
+            .map(|s| s.to_string())
+    }
+
+    fn get_macro_definition(&self, macro_node: &Node) -> String {
+        macro_node
+            .child_by_field_name("value")
+            .and_then(|n| n.utf8_text(self.source.as_bytes()).ok())
+            .unwrap_or("")
+            .to_string()
+    }
+
     fn update_import_graph(&mut self, path: &Path) {
-        println!("Updating import graph for: {:?}", path);
         if let Some(parsed_file) = self.parsed_files.get(path) {
             let imports: Vec<PathBuf> = parsed_file
                 .imports
                 .iter()
                 .filter_map(|import| self.resolve_import(path, import))
                 .collect();
-            println!("Found {} resolved imports", imports.len());
             self.import_graph.insert(path.to_path_buf(), imports);
         }
-        println!("Import graph updated");
     }
 
     fn resolve_import(&self, current_file: &Path, import: &Import) -> Option<PathBuf> {
-        println!(
-            "Resolving import: {} for file: {:?}",
-            import.path, current_file
-        );
         for include_path in &self.include_paths {
             let mut candidate_path = include_path.clone();
             candidate_path.push(&import.path);
 
             if candidate_path.exists() {
-                println!("Resolved import to: {:?}", candidate_path);
                 return Some(candidate_path);
             }
         }
-        println!("Could not resolve import: {}", import.path);
         None
     }
 
     fn generate_description(&self, file: &ParsedFile) -> String {
-        println!("Generating description for file: {:?}", file.path);
-        let description = format!(
+        format!(
             "Header file containing {} functions, {} types, and {} macros",
             file.functions.len(),
             file.types.len(),
             file.macros.len(),
-        );
-        println!("Generated description: {}", description);
-        description
+        )
     }
 
     pub fn analyze_c_file(
         &mut self,
         c_file_path: &Path,
     ) -> Result<Vec<HeaderSummary>, AnalyzerError> {
-        println!("Starting analysis of C file: {:?}", c_file_path);
         let mut analyzed_headers = HashSet::new();
         let mut summaries = Vec::new();
 
         self.analyze_file_recursive(c_file_path, &mut analyzed_headers, &mut summaries)?;
 
-        println!(
-            "Analysis complete. Found {} header summaries",
-            summaries.len()
-        );
         Ok(summaries)
     }
 
@@ -282,25 +378,20 @@ impl CFileAnalyzer {
         analyzed_headers: &mut HashSet<PathBuf>,
         summaries: &mut Vec<HeaderSummary>,
     ) -> Result<(), AnalyzerError> {
-        println!("Analyzing file: {:?}", file_path);
         if analyzed_headers.contains(file_path) {
-            println!("File already analyzed, skipping: {:?}", file_path);
             return Ok(());
         }
 
         self.parse_file(file_path)?;
         analyzed_headers.insert(file_path.to_path_buf());
-        println!("File parsed and added to analyzed headers: {:?}", file_path);
 
         let mut imports_to_analyze = Vec::new();
         let mut summary = None;
 
         if let Some(parsed_file) = self.parsed_files.get(file_path) {
-            println!("Found parsed file for: {:?}", file_path);
             for import in &parsed_file.imports {
                 if !import.is_system {
                     if let Some(resolved_path) = self.resolve_import(file_path, import) {
-                        println!("Found non-system import to analyze: {:?}", resolved_path);
                         imports_to_analyze.push(resolved_path);
                     }
                 }
@@ -313,20 +404,16 @@ impl CFileAnalyzer {
                 types: parsed_file.types.clone(),
                 macros: parsed_file.macros.clone(),
             });
-            println!("Created summary for file: {:?}", file_path);
         }
 
         for import_path in imports_to_analyze {
-            println!("Recursively analyzing import: {:?}", import_path);
             self.analyze_file_recursive(&import_path, analyzed_headers, summaries)?;
         }
 
         if let Some(summary) = summary {
             summaries.push(summary);
-            println!("Added summary to results for file: {:?}", file_path);
         }
 
-        println!("Completed analysis of file: {:?}", file_path);
         Ok(())
     }
 }
@@ -355,48 +442,57 @@ mod tests {
         assert_eq!(analyzer.include_paths[0], include_path);
     }
 
-    // Test  imports
     #[test]
     fn test_extract_imports() {
-        let analyzer = CFileAnalyzer::new();
+        let mut analyzer = CFileAnalyzer::new();
         let content = r#"
             #include <stdio.h>
             #include "my_header.h"
         "#;
+        let mut tmp_file = NamedTempFile::new().unwrap();
+        write!(tmp_file, "{}", content).unwrap();
+        let path = tmp_file.path().to_path_buf();
+        analyzer.parse_file(path.as_path()).unwrap();
 
-        let imports = analyzer.extract_imports(content);
-        assert_eq!(imports.len(), 2);
-        assert_eq!(imports[0].path, "stdio.h");
-        assert!(imports[0].is_system);
-        assert_eq!(imports[1].path, "my_header.h");
-        assert!(!imports[1].is_system);
+        let parsed_file = analyzer.parsed_files.get(&path).unwrap();
+        assert_eq!(parsed_file.imports.len(), 2);
+        assert_eq!(parsed_file.imports[0].path, "stdio.h");
+        assert!(parsed_file.imports[0].is_system);
+        assert_eq!(parsed_file.imports[1].path, "my_header.h");
+        assert!(!parsed_file.imports[1].is_system);
     }
 
     #[test]
     fn test_extract_functions() {
-        let analyzer = CFileAnalyzer::new();
+        let mut analyzer = CFileAnalyzer::new();
         let content = r#"
             int add(int a, int b);
-            void say_hello();
+            void say_hello(void);
         "#;
+        let mut tmp_file = NamedTempFile::new().unwrap();
+        write!(tmp_file, "{}", content).unwrap();
+        let path = tmp_file.path().to_path_buf();
+        analyzer.parse_file(path.as_path()).unwrap();
 
-        let functions = analyzer.extract_functions(content);
-        assert_eq!(functions.len(), 2);
-        assert_eq!(functions[0].name, "add");
-        assert_eq!(functions[0].return_type, "int");
+        let parsed_file = analyzer.parsed_files.get(&path).unwrap();
+        assert_eq!(parsed_file.functions.len(), 2);
+        assert_eq!(parsed_file.functions[0].name, "add");
+        assert_eq!(parsed_file.functions[0].return_type, "int");
         assert_eq!(
-            functions[0].parameters[0],
+            parsed_file.functions[0].parameters[0],
             ("int".to_string(), "a".to_string())
         );
-
-        assert_eq!(functions[1].name, "say_hello");
-        assert_eq!(functions[1].return_type, "void");
-        assert!(functions[1].parameters.is_empty());
+        assert_eq!(parsed_file.functions[1].name, "say_hello");
+        assert_eq!(parsed_file.functions[1].return_type, "void");
+        assert_eq!(
+            parsed_file.functions[1].parameters[0],
+            ("void".to_string(), "".to_string())
+        );
     }
 
     #[test]
     fn test_extract_types() {
-        let analyzer = CFileAnalyzer::new();
+        let mut analyzer = CFileAnalyzer::new();
         let content = r#"
             typedef int myint;
             typedef struct MyStruct {
@@ -404,50 +500,55 @@ mod tests {
                 int y;
             } MyStruct;
         "#;
+        let mut tmp_file = NamedTempFile::new().unwrap();
+        write!(tmp_file, "{}", content).unwrap();
+        let path = tmp_file.path().to_path_buf();
+        analyzer.parse_file(path.as_path()).unwrap();
 
-        let types = analyzer.extract_types(content);
-        assert_eq!(types.len(), 2);
-        assert_eq!(types[0].name, "myint");
-        assert_eq!(types[1].name, "MyStruct");
+        let parsed_file = analyzer.parsed_files.get(&path).unwrap();
+        assert_eq!(parsed_file.types.len(), 2);
+        assert_eq!(parsed_file.types[0].name, "myint");
+        assert_eq!(parsed_file.types[1].name, "MyStruct");
     }
 
     #[test]
     fn test_extract_macros() {
-        let analyzer = CFileAnalyzer::new();
+        let mut analyzer = CFileAnalyzer::new();
         let content = r#"
         #define MAX 100
         #define SQUARE(x) ((x) * (x))
-    "#;
+        "#;
+        let mut tmp_file = NamedTempFile::new().unwrap();
+        write!(tmp_file, "{}", content).unwrap();
+        let path = tmp_file.path().to_path_buf();
+        analyzer.parse_file(path.as_path()).unwrap();
 
-        let macros = analyzer.extract_macros(content);
-        assert_eq!(macros.len(), 2);
-        assert_eq!(macros[0].name, "MAX");
-        assert_eq!(macros[0].definition, "100");
-        assert_eq!(macros[1].name, "SQUARE");
-        assert_eq!(macros[1].definition, "((x) * (x))");
+        let parsed_file = analyzer.parsed_files.get(&path).unwrap();
+        assert_eq!(parsed_file.macros.len(), 2);
+        assert_eq!(parsed_file.macros[0].name, "MAX");
+        assert_eq!(parsed_file.macros[0].definition, "100");
+        assert_eq!(parsed_file.macros[1].name, "SQUARE");
+        assert_eq!(parsed_file.macros[1].definition, "((x) * (x))");
     }
 
     #[test]
     fn test_parse_file() {
         let mut analyzer = CFileAnalyzer::new();
 
-        let mut tmp_file = NamedTempFile::new().unwrap();
-        write!(
-            tmp_file,
-            r#"
+        let content = r#"
             #include <stdio.h>
             typedef int myint;
-            void say_hello();
+            void say_hello(void);
             #define MAX 100
-        "#
-        )
-        .unwrap();
-
+        "#;
+        let mut tmp_file = NamedTempFile::new().unwrap();
+        write!(tmp_file, "{}", content).unwrap();
         let path = tmp_file.path().to_path_buf();
         analyzer.parse_file(path.as_path()).unwrap();
 
         assert!(analyzer.parsed_files.contains_key(&path));
         let parsed_file = analyzer.parsed_files.get(&path).unwrap();
+        assert_eq!(parsed_file.imports.len(), 1);
         assert_eq!(parsed_file.functions.len(), 1);
         assert_eq!(parsed_file.types.len(), 1);
         assert_eq!(parsed_file.macros.len(), 1);
@@ -457,14 +558,11 @@ mod tests {
     fn test_update_import_graph() {
         let mut analyzer = CFileAnalyzer::new();
 
-        let mut tmp_file = NamedTempFile::new().unwrap();
-        write!(
-            tmp_file,
-            r#"
+        let content = r#"
             #include "my_header.h"
-        "#
-        )
-        .unwrap();
+        "#;
+        let mut tmp_file = NamedTempFile::new().unwrap();
+        write!(tmp_file, "{}", content).unwrap();
         let path = tmp_file.path().to_path_buf();
 
         analyzer.parse_file(path.as_path()).unwrap();
