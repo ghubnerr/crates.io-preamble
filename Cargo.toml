@@ -1,0 +1,18 @@
+[package]
+name = "header2crate"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+crates_io_api = "0.11.0"
+serde = { version = "1.0.210", features = ["derive"]}
+serde_json = "1.0.132"
+reqwest = { version = "0.12.8", features = ["blocking"]}
+regex = "1.11.0"
+tempfile = "3.13.0"
+
+[[bin]]
+name = "header2crate"
+path = "src/lib.rs"
