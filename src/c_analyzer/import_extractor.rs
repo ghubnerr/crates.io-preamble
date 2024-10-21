@@ -1,8 +1,6 @@
 use std::collections::{HashMap, HashSet};
-use std::error::Error;
 use std::fs;
 use std::path::{Path, PathBuf};
-use tempfile;
 use tree_sitter::{Language, Node, Parser, TreeCursor};
 
 pub struct CFileAnalyzer {
@@ -121,7 +119,7 @@ impl CFileAnalyzer {
 
     fn extract_imports(&self, node: &Node) -> Vec<Import> {
         let mut imports = Vec::new();
-        let mut cursor = node.walk();
+        let cursor = node.walk();
 
         self.traverse_tree(cursor, |node| {
             if node.kind() == "preproc_include" {
@@ -153,7 +151,7 @@ impl CFileAnalyzer {
 
     fn extract_functions(&self, node: &Node) -> Vec<Function> {
         let mut functions = Vec::new();
-        let mut cursor = node.walk();
+        let cursor = node.walk();
 
         self.traverse_tree(cursor, |node| {
             if node.kind() == "function_definition" || node.kind() == "declaration" {
@@ -176,7 +174,7 @@ impl CFileAnalyzer {
 
     fn extract_types(&self, node: &Node) -> Vec<TypeDef> {
         let mut types = Vec::new();
-        let mut cursor = node.walk();
+        let cursor = node.walk();
 
         self.traverse_tree(cursor, |node| {
             if node.kind() == "type_definition" {
@@ -224,7 +222,7 @@ impl CFileAnalyzer {
 
     fn extract_macros(&self, node: &Node) -> Vec<Macro> {
         let mut macros = Vec::new();
-        let mut cursor = node.walk();
+        let cursor = node.walk();
 
         self.traverse_tree(cursor, |node| {
             // Debug: Print the kind of each node to understand what the tree contains
