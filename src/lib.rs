@@ -52,18 +52,54 @@ fn main() {
 
     match extract_import_summaries(file_path) {
         Ok(summaries) => {
-            println!("Successfully extracted import summaries:");
+            println!("Successfully extracted import summaries:\n");
+
             for (index, summary) in summaries.iter().enumerate() {
-                println!("\nSummary {}:", index + 1);
-                println!("Path: {:?}", summary.path);
+                println!("--- Summary {} ---", index + 1);
+                println!("Header Path: {}", summary.path.display());
                 println!("Description: {}", summary.description);
-                println!("Functions: {}", summary.functions.len());
-                println!("Types: {}", summary.types.len());
-                println!("Macros: {}", summary.macros.len());
+                println!("Number of Functions: {}", summary.functions.len());
+                println!("Number of Types: {}", summary.types.len());
+                println!("Number of Macros: {}", summary.macros.len());
+
+                if !summary.functions.is_empty() {
+                    println!("Functions:");
+                    for function in &summary.functions {
+                        println!(
+                            "  - {}: {}({})",
+                            function.name,
+                            function.return_type,
+                            function
+                                .parameters
+                                .iter()
+                                .map(|(typ, name)| format!("{} {}", typ, name))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        );
+                    }
+                }
+
+                if !summary.types.is_empty() {
+                    println!("Types:");
+                    for type_def in &summary.types {
+                        println!("  - {}: {}", type_def.name, type_def.definition);
+                    }
+                }
+                if !summary.macros.is_empty() {
+                    println!("Macros:");
+                    for macro_def in &summary.macros {
+                        let params = macro_def.parameters.as_ref().map_or("None", |p| p.as_str());
+                        println!(
+                            "  - {}: {} (Parameters: {})",
+                            macro_def.name, macro_def.definition, params
+                        );
+                    }
+                }
+                println!();
             }
         }
         Err(e) => {
-            println!("Error extracting import summaries");
+            eprintln!("Error extracting import summaries: {:?}", e);
             process::exit(1);
         }
     }

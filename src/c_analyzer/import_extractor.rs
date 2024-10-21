@@ -27,22 +27,22 @@ pub struct Import {
 
 #[derive(Clone, Debug)]
 pub struct Function {
-    name: String,
-    return_type: String,
-    parameters: Vec<(String, String)>, // (type, name)
+    pub name: String,
+    pub return_type: String,
+    pub parameters: Vec<(String, String)>, // (type, name)
 }
 
 #[derive(Clone, Debug)]
 pub struct TypeDef {
-    name: String,
-    definition: String,
+    pub name: String,
+    pub definition: String,
 }
 
 #[derive(Clone, Debug)]
 pub struct Macro {
-    name: String,
-    definition: String,
-    parameters: Option<String>,
+    pub name: String,
+    pub definition: String,
+    pub parameters: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -484,6 +484,7 @@ mod tests {
             is_system: false,
         };
 
+        // Test resolution (assuming the path exists)
         let resolved = analyzer.resolve_import(Path::new("main.c"), &import);
         assert!(resolved.is_none());
     }
